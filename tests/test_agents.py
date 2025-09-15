@@ -21,6 +21,7 @@ from aviary.core import (
     Environment,
     Tool,
     ToolRequestMessage,
+    ToolResponseMessage,
     ToolsAdapter,
     ToolSelector,
 )
@@ -89,11 +90,11 @@ async def test_get_directory_index(
             "year",
         ], "Incorrect fields in index"
         assert not index.changed, "Expected index to not have changes at this point"
-        # bates.txt + empty.txt + flag_day.html + gravity_hill.md + obama.txt + paper.pdf,
+        # bates.txt + empty.txt + flag_day.html + gravity_hill.md + influence.pdf + obama.txt + paper.pdf + pasa.pdf,
         # but empty.txt fails to be added
         path_to_id = await index.index_files
         assert (
-            sum(id_ != FAILED_DOCUMENT_ADD_ID for id_ in path_to_id.values()) == 5
+            sum(id_ != FAILED_DOCUMENT_ADD_ID for id_ in path_to_id.values()) == 7
         ), "Incorrect number of parsed index files"
 
         with subtests.test(msg="check-txt-query"):
@@ -104,6 +105,14 @@ async def test_get_directory_index(
                 f"Expected to find {target_doc_path.name!r}, got citations"
                 f" {[d.formatted_citation for d in results[0].docs.values()]}."
             )
+
+            # Check single quoted text in the query doesn't crash us
+            results = await index.query(query="Who is 'Bates'")
+            assert results
+
+            # Check possessive in the query doesn't crash us
+            results = await index.query(query="What is Bates' first name")
+            assert results
 
         with subtests.test(msg="check-md-query"):
             results = await index.query(query="what is a gravity hill?", min_score=5)
@@ -138,11 +147,20 @@ async def test_get_directory_index(
         # Now we actually remove (but not add!) a file from the paper directory,
         # and we still don't reprocess files
         (paper_dir / "obama.txt").unlink()
-        with patch.object(
-            Docs, "aadd", autospec=True, side_effect=Docs.aadd
-        ) as mock_aadd:
+        with (
+            patch.object(
+                Docs, "aadd", autospec=True, side_effect=Docs.aadd
+            ) as mock_aadd,
+            patch.object(
+                agent_test_settings.agent.index,
+                "files_filter",
+                lambda f: f.suffix in {".txt", ".pdf", ".md"},  # Also, exclude HTML
+            ),
+        ):
             index = await get_directory_index(settings=agent_test_settings)
-        assert len(await index.index_files) == len(path_to_id) - 1
+        # Subtract 1 for the removed obama.txt file,
+        # and another 1 for the filtered out flag_day.html
+        assert len(await index.index_files) == len(path_to_id) - 2
         mock_aadd.assert_not_awaited(), "Expected we didn't re-add files"
 
         # Note let's delete files.zip, and confirm we can't load the index
@@ -159,7 +177,8 @@ async def test_resuming_crashed_index_build(agent_test_settings: Settings) -> No
         [
             x
             for x in cast("Path", index_settings.paper_directory).iterdir()
-            if x.suffix != ".csv"
+            # Filter out .csv and .DS_Store files
+            if x.suffix != ".csv" and agent_test_settings.agent.index.files_filter(x)
         ]
     )
     assert (
@@ -236,8 +255,10 @@ EXPECTED_STUB_DATA_FILES = {
     "empty.txt",
     "flag_day.html",
     "gravity_hill.md",
+    "influence.pdf",
     "obama.txt",
     "paper.pdf",
+    "pasa.pdf",
 }
 
 
@@ -309,7 +330,7 @@ async def test_get_directory_index_w_no_citations(
 
 @pytest.mark.flaky(reruns=2, only_rerun=["AssertionError", "httpx.RemoteProtocolError"])
 @pytest.mark.parametrize("agent_type", [FAKE_AGENT_TYPE, ToolSelector, SimpleAgent])
-@pytest.mark.parametrize("llm_name", ["gpt-4o", "gemini/gemini-1.5-flash"])
+@pytest.mark.parametrize("llm_name", ["gpt-4o", "gemini/gemini-2.0-flash-lite"])
 @pytest.mark.asyncio
 async def test_agent_types(
     agent_test_settings: Settings,
@@ -447,17 +468,30 @@ async def test_successful_memory_agent(agent_test_settings: Settings) -> None:
 @pytest.mark.asyncio
 async def test_timeout(agent_test_settings: Settings, agent_type: str | type) -> None:
     agent_test_settings.prompts.pre = None
-    agent_test_settings.agent.timeout = 0.001
+    agent_test_settings.agent.timeout = 0.05  # Give time for Environment.reset()
     agent_test_settings.llm = "gpt-4o-mini"
     agent_test_settings.agent.tool_names = {"gen_answer", "complete"}
-    response = await agent_query(
-        query="Are COVID-19 vaccines effective?",
-        settings=agent_test_settings,
-        agent_type=agent_type,
-    )
-    # ensure that GenerateAnswerTool was called
+    orig_exec_tool_calls = PaperQAEnvironment.exec_tool_calls
+    tool_responses: list[list[ToolResponseMessage]] = []
+
+    async def spy_exec_tool_calls(*args, **kwargs) -> list[ToolResponseMessage]:
+        responses = await orig_exec_tool_calls(*args, **kwargs)
+        tool_responses.append(responses)
+        return responses
+
+    with patch.object(PaperQAEnvironment, "exec_tool_calls", spy_exec_tool_calls):
+        response = await agent_query(
+            query="Are COVID-19 vaccines effective?",
+            settings=agent_test_settings,
+            agent_type=agent_type,
+        )
+    # Ensure that GenerateAnswerTool was called in truncation's failover
     assert response.status == AgentStatus.TRUNCATED, "Agent did not timeout"
     assert CANNOT_ANSWER_PHRASE in response.session.answer
+    (last_response,) = tool_responses[-1]
+    assert (
+        "no papers" in last_response.content
+    ), "Expecting agent to been shown specifics on the failure"
 
 
 @pytest.mark.flaky(reruns=5, only_rerun=["AssertionError"])
@@ -555,6 +589,13 @@ async def test_gather_evidence_rejects_empty_docs(
 async def test_agent_sharing_state(
     agent_test_settings: Settings, subtests: SubTests, callback_type: str | None
 ) -> None:
+    def files_filter(f) -> bool:
+        # Filter out pasa.pdf just to speed the test and save API costs
+        return f.name != "pasa.pdf" and IndexSettings.model_fields[
+            "files_filter"
+        ].default(f)
+
+    agent_test_settings.agent.index.files_filter = files_filter
     agent_test_settings.agent.search_count = 3  # Keep low for speed
     agent_test_settings.answer.evidence_k = 2
     agent_test_settings.answer.answer_max_sources = 1
@@ -942,6 +983,7 @@ def test_answers_are_striped() -> None:
                     ),
                 ),
                 score=3,
+                extra_field="extra_value",
             )
         ],
     )
@@ -951,6 +993,7 @@ def test_answers_are_striped() -> None:
     assert not response.session.contexts[0].text.text
     assert response.session.contexts[0].text.doc is not None
     assert response.session.contexts[0].text.doc.embedding is None
+    assert response.session.contexts[0].extra_field is not None  # type: ignore[attr-defined]
     # make sure it serializes
     response.model_dump_json()
 
@@ -993,9 +1036,9 @@ async def test_search_pagination(agent_test_settings: Settings) -> None:
 
     page_size = 1
 
-    page1_results = await index.query(query="test", top_n=page_size, offset=0)
+    page1_results = await index.query(query="test", top_n=page_size)
     page2_results = await index.query(query="test", top_n=page_size, offset=page_size)
-    page1and2_results = await index.query(query="test", top_n=2 * page_size, offset=0)
+    page1and2_results = await index.query(query="test", top_n=2 * page_size)
 
     assert (
         page1_results == page1and2_results[:page_size]
@@ -1081,7 +1124,8 @@ async def test_index_build_concurrency(agent_test_settings: Settings) -> None:
     )
 
 
-def test_env_from_name(subtests: SubTests) -> None:
+@pytest.mark.asyncio
+async def test_env_from_name(subtests: SubTests) -> None:
     assert "paperqa" in Environment.available()
 
     with subtests.test(msg="only-task"):
@@ -1089,6 +1133,8 @@ def test_env_from_name(subtests: SubTests) -> None:
             "paperqa", "How can you use XAI for chemical property prediction?"
         )
         assert isinstance(env, PaperQAEnvironment)
+        with pytest.raises(ValueError, match="configured"):
+            await env.get_id()
 
     with subtests.test(msg="env-kwargs"):
         env = Environment.from_name(

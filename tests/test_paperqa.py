@@ -1,17 +1,24 @@
+import asyncio
+import base64
 import contextlib
+import csv
+import io
 import os
 import pathlib
 import pickle
 import re
+import sys
 from collections.abc import AsyncIterable, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import cast
+from unittest.mock import MagicMock, call, patch
 from uuid import UUID
 
 import httpx
+import litellm
 import numpy as np
 import pytest
 import pytest_asyncio
@@ -28,6 +35,8 @@ from lmi import (
 )
 from lmi.llms import rate_limited
 from lmi.utils import VCR_DEFAULT_MATCH_ON
+from paperqa_pymupdf import parse_pdf_to_pages as pymupdf_parse_pdf_to_pages
+from paperqa_pypdf import parse_pdf_to_pages as pypdf_parse_pdf_to_pages
 from pytest_subtests import SubTests
 
 from paperqa import (
@@ -41,70 +50,47 @@ from paperqa import (
     Settings,
     Text,
     VectorStore,
-    print_callback,
 )
 from paperqa.clients import CrossrefProvider
 from paperqa.clients.journal_quality import JournalQualityPostProcessor
 from paperqa.core import llm_parse_json
 from paperqa.prompts import CANNOT_ANSWER_PHRASE
 from paperqa.prompts import qa_prompt as default_qa_prompt
-from paperqa.readers import read_doc
+from paperqa.readers import PDFParserFn, parse_image, read_doc
+from paperqa.settings import AsyncContextSerializer
+from paperqa.types import ChunkMetadata, Context, ParsedMedia
 from paperqa.utils import (
+    bytes_to_string,
+    clean_possessives,
+    encode_id,
     extract_score,
-    get_citenames,
     maybe_get_date,
     maybe_is_html,
     maybe_is_text,
     name_in_text,
+    string_to_bytes,
     strings_similarity,
     strip_citations,
+    validate_image,
 )
 
 THIS_MODULE = pathlib.Path(__file__)
 
 
-@pytest_asyncio.fixture
-async def docs_fixture(stub_data_dir: Path) -> Docs:
+@pytest_asyncio.fixture(name="docs_fixture")
+async def fixture_docs_fixture(stub_data_dir: Path) -> Docs:
     docs = Docs()
     with (stub_data_dir / "paper.pdf").open("rb") as f:
         await docs.aadd_file(f, "Wellawatte et al, XAI Review, 2023")
     return docs
 
 
-def test_get_citations() -> None:
-    text = (
-        "Yes, COVID-19 vaccines are effective. Various studies have documented the"
-        " effectiveness of COVID-19 vaccines in preventing severe disease,"
-        " hospitalization, and death. The BNT162b2 vaccine has shown effectiveness"
-        " ranging from 65% to -41% for the 5-11 years age group and 76% to 46% for the"
-        " 12-17 years age group, after the emergence of the Omicron variant in New York"
-        " (Dorabawila2022EffectivenessOT). Against the Delta variant, the effectiveness"  # spellchecker: disable-line
-        " of the BNT162b2 vaccine was approximately 88% after two doses"
-        " (Bernal2021EffectivenessOC pg. 1-3).\n\nVaccine effectiveness was also found"
-        " to be 89% against hospitalization and 91% against emergency department or"
-        " urgent care clinic visits (Thompson2021EffectivenessOC pg. 3-5, Goo2031Foo"
-        " pg. 3-4). In the UK vaccination program, vaccine effectiveness was"
-        " approximately 56% in individuals aged ≥70 years between 28-34 days"
-        " post-vaccination, increasing to approximately 58% from day 35 onwards"
-        " (Marfé2021EffectivenessOC).\n\nHowever, it is important to note that vaccine"
-        " effectiveness can decrease over time. For instance, the effectiveness of"
-        " COVID-19 vaccines against severe COVID-19 declined to 64% after 121 days,"
-        " compared to around 90% initially (Chemaitelly2022WaningEO, Foo2019Bar)."
-        " Despite this, vaccines still provide significant protection against severe"
-        " outcomes (Bar2000Foo pg 1-3; Far2000 pg 2-5)."
+def test_encode_id() -> None:
+    assert (
+        encode_id("10.1056/nejmoa2119451")
+        == encode_id("10.1056/NEJMOA2119451")
+        == "945f1f30b11bcae6"
     )
-    ref = {
-        "Dorabawila2022EffectivenessOT",  # spellchecker: disable-line
-        "Bernal2021EffectivenessOC pg. 1-3",
-        "Thompson2021EffectivenessOC pg. 3-5",
-        "Goo2031Foo pg. 3-4",
-        "Marfé2021EffectivenessOC",
-        "Chemaitelly2022WaningEO",
-        "Foo2019Bar",
-        "Bar2000Foo pg 1-3",
-        "Far2000 pg 2-5",
-    }
-    assert get_citenames(text) == ref
 
 
 def test_single_author() -> None:
@@ -323,7 +309,8 @@ def test_extract_score() -> None:
     of Covid-19 vaccinations.
     """
 
-    assert extract_score(sample) == 5
+    with pytest.raises(ValueError, match="Failed to extract score"):
+        extract_score(sample)
 
     sample = """
     Introduce dynamic elements such as moving nodes or edges to create a sense of activity within
@@ -493,7 +480,7 @@ async def test_docs_lifecycle(subtests: SubTests, stub_data_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_evidence(docs_fixture) -> None:
+async def test_evidence(docs_fixture: Docs) -> None:
     debug_settings = Settings.from_name("debug")
     evidence = (
         await docs_fixture.aget_evidence(
@@ -502,10 +489,43 @@ async def test_evidence(docs_fixture) -> None:
         )
     ).contexts
     assert len(evidence) >= debug_settings.answer.evidence_k
+    assert len({e.context for e in evidence}) == len(
+        evidence
+    ), "Expected unique contexts"
+    texts = {c.text for c in evidence}
+    assert texts, "Below assertions require at least one text to be used"
+    orig_acompletion = litellm.acompletion
+    has_made_scoreless_context = False
+    no_score_context_body = "MAKEUNIQUE Explainable Artificial Intelligence (XAI)"
+
+    async def acompletion_that_breaks_first_context(*args, **kwargs):
+        completion = await orig_acompletion(*args, **kwargs)
+        nonlocal has_made_scoreless_context
+        if not has_made_scoreless_context:
+            assert len(completion.choices) == 1, "Test expects one choice"
+            completion.choices[0].message.content = no_score_context_body
+            has_made_scoreless_context = True
+        return completion
+
+    # Let's check we are resilient to bad context creation
+    with patch.object(litellm, "acompletion", acompletion_that_breaks_first_context):
+        # Let's also check we can get other evidence using the same underlying sources
+        other_evidence = (
+            await docs_fixture.aget_evidence(
+                PQASession(question="What is an acronym for explainable AI?"),
+                settings=debug_settings,
+            )
+        ).contexts
+    assert all(
+        c.context != no_score_context_body for c in other_evidence
+    ), "Expected context without score to be replaced via retrying"
+    assert texts.intersection(
+        {c.text for c in other_evidence}
+    ), "We should be able to reuse sources across evidence calls"
 
 
 @pytest.mark.asyncio
-async def test_json_evidence(docs_fixture) -> None:
+async def test_json_evidence(docs_fixture: Docs) -> None:
     settings = Settings.from_name("fast")
     settings.prompts.use_json = True
     settings.prompts.summary_json_system = (
@@ -518,13 +538,38 @@ async def test_json_evidence(docs_fixture) -> None:
         " author , and `relevance_score` is  the relevance of `summary` to answer the"
         " question (integer out of 10)."
     )
-    evidence = (
-        await docs_fixture.aget_evidence(
-            PQASession(question="Who wrote this article?"),
-            settings=settings,
-        )
-    ).contexts
-    assert evidence[0].author_name
+    orig_acompletion = litellm.acompletion
+    has_made_bad_json_context = False
+    bad_json_context = (  # Broken summary and relevance_score
+        '{\n  "summary": "Complete of th'
+        '\n  "author_name": "Sentinel value.",'
+        '\n  "relevance_score": "A"\n}'
+    )
+
+    async def acompletion_that_breaks_first_context(*args, **kwargs):
+        completion = await orig_acompletion(*args, **kwargs)
+        nonlocal has_made_bad_json_context
+        if not has_made_bad_json_context:
+            assert len(completion.choices) == 1, "Test expects one choice"
+            completion.choices[0].message.content = bad_json_context
+            has_made_bad_json_context = True
+        return completion
+
+    # Let's check we are resilient to bad context creation
+    with patch.object(litellm, "acompletion", acompletion_that_breaks_first_context):
+        evidence = (
+            await docs_fixture.aget_evidence(
+                PQASession(question="Who wrote this article?"),
+                settings=settings,
+            )
+        ).contexts
+    evidence_with_authors = [
+        c for c in evidence if hasattr(c, "author_name") and c.author_name
+    ]
+    assert evidence_with_authors
+    assert all(
+        "sentinel" not in c.author_name.lower() for c in evidence_with_authors
+    ), "Expected broken context retrying to work"
 
 
 @pytest.mark.asyncio
@@ -574,6 +619,108 @@ async def test_query(docs_fixture) -> None:
 
 
 @pytest.mark.asyncio
+async def test_custom_context_str_fn(docs_fixture) -> None:
+
+    async def custom_context_str_fn(  # noqa: RUF029
+        settings: Settings,  # noqa: ARG001
+        contexts: list[Context],  # noqa: ARG001
+        question: str,  # noqa: ARG001
+        pre_str: str | None = None,  # noqa: ARG001
+    ) -> str:
+        return "TEST OVERRIDE"
+
+    assert isinstance(custom_context_str_fn, AsyncContextSerializer)
+
+    settings = Settings(
+        custom_context_serializer=custom_context_str_fn,
+        prompts={"answer_iteration_prompt": None},
+    )
+
+    session = await docs_fixture.aquery(
+        "Is XAI usable in chemistry?", settings=settings
+    )
+    assert (
+        session.context == "TEST OVERRIDE"
+    ), "Expected custom context string to be returned."
+
+
+@pytest.mark.asyncio
+async def test_aquery_groups_contexts_by_question(docs_fixture) -> None:
+
+    session = PQASession(question="What is the relationship between chemistry and AI?")
+
+    doc = Doc(docname="test_doc", citation="Test Doc, 2025", dockey="key1")
+    text1 = Text(text="XAI is useful for molecules.", name="t1", doc=doc)
+    text2 = Text(text="Drug discovery uses AI.", name="t2", doc=doc)
+    text3 = Text(text="Organic chemistry is a field.", name="t3", doc=doc)
+
+    session.contexts = [
+        Context(
+            text=text1,
+            context="Explanation about XAI and molecules (Smith 1999).",
+            score=6,
+            question="Is XAI usable in chemistry?",
+        ),
+        Context(
+            text=text2,
+            context="Details on how drug discovery leverages AI.",
+            score=5,
+            question="Is XAI usable in chemistry?",
+        ),
+        Context(
+            text=text3,
+            context="General facts about organic chemistry.",
+            score=5,
+            question="What is organic chemistry?",
+        ),
+    ]
+
+    settings = Settings(
+        prompts={"answer_iteration_prompt": None},
+        answer={
+            "group_contexts_by_question": True,
+            "skip_evidence_citation_strip": True,
+        },
+    )
+
+    result = await docs_fixture.aquery(session, settings=settings)
+
+    final_context_str = result.context
+
+    assert (
+        'Contexts related to the question: "Is XAI usable in chemistry?"'
+        in final_context_str
+    )
+
+    assert (
+        'Contexts related to the question: "What is organic chemistry?"'
+        in final_context_str
+    )
+
+    assert "Explanation about XAI and molecules (Smith 1999)." in final_context_str
+    assert "Details on how drug discovery leverages AI." in final_context_str
+    assert "General facts about organic chemistry." in final_context_str
+
+    assert "\n\n----\n\n" in final_context_str
+    q1_header_pos = final_context_str.find(
+        'Contexts related to the question: "Is XAI usable in chemistry?"'
+    )
+    q2_header_pos = final_context_str.find(
+        'Contexts related to the question: "What is organic chemistry?"'
+    )
+    context1_pos = final_context_str.find(
+        "Explanation about XAI and molecules (Smith 1999)."
+    )
+    context3_pos = final_context_str.find("General facts about organic chemistry.")
+
+    assert (
+        0 == q1_header_pos < context1_pos
+    ), "Expected q1 header to be first, and the context to follow."
+    assert q1_header_pos < q2_header_pos
+    assert q2_header_pos < context3_pos
+
+
+@pytest.mark.asyncio
 async def test_query_with_iteration(docs_fixture) -> None:
     # we store these results to check that the prompts are OK
     my_results: list[LLMResult] = []
@@ -606,7 +753,7 @@ async def test_llmresult_callback(docs_fixture: Docs) -> None:
         "What is XAI?", settings=settings, summary_llm_model=summary_llm
     )
     assert my_results
-    assert len(my_results) >= 1, "Expected the callback to append results"
+    assert my_results, "Expected the callback to append results"
     assert my_results[0].name
     assert my_results[0].session_id
 
@@ -641,7 +788,7 @@ async def test_llmresult_callback(docs_fixture: Docs) -> None:
 async def test_get_reasoning(docs_fixture: Docs, llm: str, llm_settings: dict) -> None:
     settings = Settings(
         llm=llm,
-        llm_settings=llm_settings,
+        llm_config=llm_settings,
     )
     response = await docs_fixture.aquery("What is XAI?", settings=settings)
     assert response.answer_reasoning
@@ -735,7 +882,7 @@ async def test_docs_with_custom_embedding(
             )
             assert collection_info.points_count > 0
         assert len(docs.texts_index) > 0
-        assert len(docs.texts_index.texts_hashes) > 0
+        assert docs.texts_index.texts_hashes
 
         # Clear the vector store via Docs
         docs.clear_docs()
@@ -745,7 +892,7 @@ async def test_docs_with_custom_embedding(
             assert not await docs.texts_index._collection_exists()
             assert docs.texts_index._point_ids is None
         assert len(docs.texts_index) == 0
-        assert len(docs.texts_index.texts_hashes) == 0
+        assert not docs.texts_index.texts_hashes
 
 
 @pytest.mark.asyncio
@@ -820,7 +967,7 @@ async def test_custom_llm(stub_data_dir: Path) -> None:
             return [
                 LLMResult(
                     model=self.name,
-                    text="Echo",
+                    text="Echo 2",
                     prompt=messages,
                     prompt_count=1,
                     completion_count=1,
@@ -833,7 +980,7 @@ async def test_custom_llm(stub_data_dir: Path) -> None:
         ) -> AsyncIterable[LLMResult]:
             yield LLMResult(
                 model=self.name,
-                text="Echo",
+                text="Echo 2",
                 prompt=messages,
                 prompt_count=1,
                 completion_count=1,
@@ -856,16 +1003,21 @@ async def test_custom_llm(stub_data_dir: Path) -> None:
             "Echo", summary_llm_model=StubLLMModel(), settings=no_json_settings
         )
     ).contexts
+    assert evidence
     assert "Echo" in evidence[0].context
+
+    async def test_callback(result: LLMResult | str) -> None:
+        """Empty callback for testing purposes."""
 
     evidence = (
         await docs.aget_evidence(
             "Echo",
-            callbacks=[print_callback],
+            callbacks=[test_callback],
             summary_llm_model=StubLLMModel(),
             settings=no_json_settings,
         )
     ).contexts
+    assert evidence
     assert "Echo" in evidence[0].context
 
 
@@ -944,25 +1096,19 @@ async def test_repeat_keys(stub_data_dir) -> None:
 
 
 @pytest.mark.asyncio
-async def test_can_read_normal_pdf_reader(docs_fixture) -> None:
-    answer = await docs_fixture.aquery("Are counterfactuals actionable? [yes/no]")
-    assert "yes" in answer.answer or "Yes" in answer.answer
-
-
-@pytest.mark.asyncio
 async def test_pdf_reader_w_no_match_doc_details(stub_data_dir: Path) -> None:
     docs = Docs()
-    await docs.aadd(
+    docname = await docs.aadd(
         stub_data_dir / "paper.pdf",
         "Wellawatte et al, XAI Review, 2023",
     )
+    (doc_details,) = docs.docs.values()
+    assert doc_details.docname == docname, "Added name should match between details"
     # doc will be a DocDetails object, but nothing can be found
     # thus, we retain the prior citation data
     assert (
-        next(iter(docs.docs.values())).citation == "Wellawatte et al, XAI Review, 2023"
-    )
-    assert (
-        next(iter(docs.docs.values())).formatted_citation
+        doc_details.citation
+        == doc_details.formatted_citation
         == "Wellawatte et al, XAI Review, 2023"
     ), "Formatted citation should be the same when no metadata is found."
 
@@ -1002,12 +1148,14 @@ async def test_partly_embedded_texts(defer_embeddings: bool) -> None:
     pre_embedded_text.embedding = (
         await settings.get_embedding_model().embed_documents([pre_embedded_text.text])
     )[0]
+    # Some of these texts are partly embedded, some are not
     texts_to_add = [
         pre_embedded_text,
         Text(text="I like cats.", name="sentence2", doc=stub_doc),
     ]
+    assert texts_to_add[0] != texts_to_add[1], "Test assumes different texts"
 
-    # 1. Add texts (and some are partly embedded)
+    # 1. Add texts, noting some are partly embedded
     await docs.aadd_texts(texts=texts_to_add, doc=stub_doc)
     assert docs.texts == texts_to_add
     assert not docs.texts_index.texts
@@ -1032,7 +1180,7 @@ async def test_partly_embedded_texts(defer_embeddings: bool) -> None:
 @pytest.mark.asyncio
 async def test_pdf_reader_match_doc_details(stub_data_dir: Path) -> None:
     docs = Docs()
-    await docs.aadd(
+    docname = await docs.aadd(
         stub_data_dir / "paper.pdf",
         "Wellawatte et al, A Perspective on Explanations of Molecular Prediction"
         " Models, XAI Review, 2023",
@@ -1043,7 +1191,8 @@ async def test_pdf_reader_match_doc_details(stub_data_dir: Path) -> None:
         },  # Limit to only crossref since s2 is too flaky
         fields=["author", "journal", "citation_count"],
     )
-    doc_details = next(iter(docs.docs.values()))
+    (doc_details,) = docs.docs.values()
+    assert doc_details.docname == docname, "Added name should match between details"
     # Crossref is non-deterministic in its ordering for results
     # thus we need to capture both possible dockeys
     assert doc_details.dockey in {"d7763485f06aabde", "5300ef1d5fb960d7"}
@@ -1070,26 +1219,32 @@ async def test_pdf_reader_match_doc_details(stub_data_dir: Path) -> None:
     assert num_citations >= 1, "Expected at least one citation"
     assert (
         "Journal of Chemical Theory and Computation" in doc_details.formatted_citation
-    )
+    ) or ("ChemRxiv" in doc_details.formatted_citation)
 
     num_retries = 3
     for _ in range(num_retries):
-        answer = await docs.aquery("Are counterfactuals actionable? [yes/no]")
-        if any(w in answer.answer for w in ("yes", "Yes")):
-            assert f"This article has {num_citations} citations" in answer.context
+        session = await docs.aquery("Are counterfactuals actionable? [yes/no]")
+        if any(w in session.answer for w in ("yes", "Yes")):
+            assert f"This article has {num_citations} citations" in session.context
+            assert any(
+                c.id in session.raw_answer for c in session.contexts
+            ), "No context ids found in answer"
+            assert all(
+                c.id not in session.formatted_answer for c in session.contexts
+            ), "Context ids should not be in formatted answer"
             return
     raise AssertionError(f"Query was incorrect across {num_retries} retries.")
 
 
 @pytest.mark.asyncio
 async def test_fileio_reader_pdf(stub_data_dir: Path) -> None:
+    docs = Docs()
     with (stub_data_dir / "paper.pdf").open("rb") as f:
-        docs = Docs()
         await docs.aadd_file(f, "Wellawatte et al, XAI Review, 2023")
     num_retries = 3
     for _ in range(num_retries):
-        answer = await docs.aquery("Are counterfactuals actionable? [yes/no]")
-        if any(w in answer.answer for w in ("yes", "Yes")):
+        session = await docs.aquery("Are counterfactuals actionable? [yes/no]")
+        if any(w in session.answer for w in ("yes", "Yes")):
             return
     raise AssertionError(f"Query was incorrect across {num_retries} retries.")
 
@@ -1105,75 +1260,254 @@ async def test_fileio_reader_txt(stub_data_dir: Path) -> None:
         BytesIO(file_content),
         "WikiMedia Foundation, 2023, Accessed now",
     )
-    answer = await docs.aquery("What country was Frederick Bates born in?")
-    assert "United States" in answer.answer
+    session = await docs.aquery("What country was Frederick Bates born in?")
+    assert "United States" in session.answer
 
 
 @pytest.mark.asyncio
-async def test_parser_only_reader(stub_data_dir: Path):
+@pytest.mark.parametrize(
+    "pdf_parser", [pypdf_parse_pdf_to_pages, pymupdf_parse_pdf_to_pages]
+)
+async def test_parser_only_reader(pdf_parser: PDFParserFn, stub_data_dir: Path) -> None:
     doc_path = stub_data_dir / "paper.pdf"
     parsed_text = await read_doc(
         Path(doc_path),
         Doc(docname="foo", citation="Foo et al, 2002", dockey="1"),
         parsed_text_only=True,
+        parse_pdf=pdf_parser,
+        full_page=True,  # Simple to support across many parsers
     )
     assert parsed_text.metadata.parse_type == "pdf"
     assert parsed_text.metadata.chunk_metadata is None
-    assert parsed_text.metadata.total_parsed_text_length == sum(
-        len(t) for t in parsed_text.content.values()  # type: ignore[misc,union-attr]
-    )
+    assert isinstance(parsed_text.content, dict)
+    num_chars = 0
+    for value in parsed_text.content.values():
+        assert isinstance(value, tuple)
+        num_chars += len(value[0])
+    assert parsed_text.metadata.count_parsed_media > 1
+    assert parsed_text.metadata.count_parsed_media == len(
+        parsed_text.content
+    ), "Full parsing should have one screenshot per page"
+    assert parsed_text.metadata.total_parsed_text_length == num_chars
 
 
 @pytest.mark.asyncio
-async def test_chunk_metadata_reader(stub_data_dir: Path) -> None:
-    doc_path = stub_data_dir / "paper.pdf"
+@pytest.mark.parametrize(
+    "pdf_parser",
+    [
+        pymupdf_parse_pdf_to_pages  # TODO: add PyPDF when it supports multiple images/page
+    ],
+)
+async def test_chunk_metadata_reader(
+    pdf_parser: PDFParserFn, stub_data_dir: Path
+) -> None:
     chunk_text, metadata = await read_doc(
-        Path(doc_path),
+        stub_data_dir / "paper.pdf",
         Doc(docname="foo", citation="Foo et al, 2002", dockey="1"),
         parsed_text_only=False,  # noqa: FURB120
         include_metadata=True,
+        parse_pdf=pdf_parser,
     )
     assert metadata.parse_type == "pdf"
-    assert metadata.chunk_metadata.chunk_type == "overlap_pdf_by_page"  # type: ignore[union-attr]
-    assert metadata.chunk_metadata.overlap == 100  # type: ignore[union-attr]
-    assert metadata.chunk_metadata.chunk_chars == 3000  # type: ignore[union-attr]
-    assert all(len(chunk.text) <= 3000 for chunk in chunk_text)
-    assert metadata.total_parsed_text_length // 3000 <= len(chunk_text)
+    assert isinstance(metadata.chunk_metadata, ChunkMetadata)
+    assert metadata.chunk_metadata.chunk_type == "overlap_pdf_by_page"
+    assert metadata.chunk_metadata.overlap == 100
+    assert metadata.chunk_metadata.chunk_chars == 3000
+    assert len(chunk_text) > 2, "Expected multiple chunks, for meaningful assertions"
+    assert all(
+        len(chunk.text) <= metadata.chunk_metadata.chunk_chars for chunk in chunk_text
+    )
+    assert (
+        metadata.total_parsed_text_length // metadata.chunk_metadata.chunk_chars
+        <= len(chunk_text)
+    )
     assert all(
         chunk_text[i].text[-100:] == chunk_text[i + 1].text[:100]
         for i in range(len(chunk_text) - 1)
     )
-
-    doc_path = stub_data_dir / "flag_day.html"
+    # Let's check the pages in the chunk names
+    first_page, _ = chunk_text[0].name.rsplit(" ", maxsplit=1)[-1].split("-")
+    assert first_page == "1", "First chunk should be for page 1"
+    stlast_page, last_page = chunk_text[-1].name.rsplit(" ", maxsplit=1)[-1].split("-")
+    assert (
+        int(last_page) - int(first_page) > 2
+    ), "Expected many pages, for meaningful assertions"
+    assert (
+        len(chunk_text[-1].text) < metadata.chunk_metadata.chunk_chars
+    ), "Expected last chunk to be a partial chunk, for meaningful assertions"
+    assert (
+        int(last_page) - int(stlast_page) <= 2
+    ), "Incorrect page range if last chunk is a partial chunk"
+    assert metadata.count_parsed_media > 1, "Expected media to be parsed"
+    assert (
+        sum(len(t.media) for t in chunk_text) == metadata.count_parsed_media
+    ), "Expected chunks' media to match parsed media"
 
     chunk_text, metadata = await read_doc(
-        Path(doc_path),
+        stub_data_dir / "flag_day.html",
         Doc(docname="foo", citation="Foo et al, 2002", dockey="1"),
         parsed_text_only=False,  # noqa: FURB120
         include_metadata=True,
     )
     # NOTE the use of tiktoken changes the actual char and overlap counts
     assert metadata.parse_type == "html"
-    assert metadata.chunk_metadata.chunk_type == "overlap"  # type: ignore[union-attr]
-    assert metadata.chunk_metadata.overlap == 100  # type: ignore[union-attr]
-    assert metadata.chunk_metadata.chunk_chars == 3000  # type: ignore[union-attr]
-    assert all(len(chunk.text) <= 3000 * 1.25 for chunk in chunk_text)
-    assert metadata.total_parsed_text_length // 3000 <= len(chunk_text)
-
-    doc_path = Path(os.path.abspath(__file__))
-
-    chunk_text, metadata = await read_doc(
-        doc_path,
-        Doc(docname="foo", citation="Foo et al, 2002", dockey="1"),
-        parsed_text_only=False,  # noqa: FURB120
-        include_metadata=True,
+    assert isinstance(metadata.chunk_metadata, ChunkMetadata)
+    assert metadata.chunk_metadata.chunk_type == "overlap"
+    assert metadata.chunk_metadata.overlap == 100
+    assert metadata.chunk_metadata.chunk_chars == 3000
+    assert all(
+        len(chunk.text) <= metadata.chunk_metadata.chunk_chars * 1.25
+        for chunk in chunk_text
     )
-    assert metadata.parse_type == "txt"
-    assert metadata.chunk_metadata.chunk_type == "overlap_code_by_line"  # type: ignore[union-attr]
-    assert metadata.chunk_metadata.overlap == 100  # type: ignore[union-attr]
-    assert metadata.chunk_metadata.chunk_chars == 3000  # type: ignore[union-attr]
-    assert all(len(chunk.text) <= 3000 * 1.25 for chunk in chunk_text)
-    assert metadata.total_parsed_text_length // 3000 <= len(chunk_text)
+    assert (
+        metadata.total_parsed_text_length // metadata.chunk_metadata.chunk_chars
+        <= len(chunk_text)
+    )
+
+    for code_input in (
+        Path(__file__),  # Python gets parsed into `list[str]` content
+        stub_data_dir / ".DS_Store",  # .DS_Store gets parsed into `str` content
+        stub_data_dir / "py.typed",  # Marker file gets parsed into empty `list` content
+    ):
+        chunk_text, metadata = await read_doc(
+            path=code_input,
+            doc=Doc(docname="foo", citation="Foo et al, 2002", dockey="1"),
+            include_metadata=True,
+        )
+        assert metadata.parse_type == "txt"
+        assert isinstance(metadata.chunk_metadata, ChunkMetadata)
+        assert metadata.chunk_metadata.chunk_type == "overlap_code_by_line"
+        assert metadata.chunk_metadata.overlap == 100
+        assert metadata.chunk_metadata.chunk_chars == 3000
+        assert all(
+            len(chunk.text) <= metadata.chunk_metadata.chunk_chars * 1.25
+            for chunk in chunk_text
+        )
+        assert (
+            metadata.total_parsed_text_length // metadata.chunk_metadata.chunk_chars
+            <= len(chunk_text)
+        )
+
+
+@pytest.mark.asyncio
+async def test_image_aggregation(stub_data_dir: Path) -> None:
+    png_path = stub_data_dir / "sf_districts.png"
+
+    # Test how self-comparisons work
+    ((_, (parsed_image,)),) = cast(dict, (await parse_image(png_path)).content).values()
+    assert parsed_image == parsed_image, "Expected equality"  # noqa: PLR0124
+    assert parsed_image.to_id() == parsed_image.to_id(), "Expected same ID"
+    assert len({parsed_image, parsed_image}) == 1, "Expected shared hash"
+    assert not parsed_image.text, "Expected no text for later assertions to make sense"
+    assert (
+        parsed_image.info.get("type") != "table"
+    ), "Expected no table for later assertions to make sense"
+
+    # Test how self-comparisons work
+    ((_, (parsed_image2,)),) = cast(
+        dict, (await parse_image(png_path)).content
+    ).values()
+    assert parsed_image == parsed_image2, "Expected equality to persist across reads"
+    assert (
+        parsed_image.to_id() == parsed_image2.to_id()
+    ), "Expected ID to persist across reads"
+    assert (
+        len({parsed_image, parsed_image2}) == 1
+    ), "Expected hash to persist across reads"
+
+    # Test different read details
+    ((_, (parsed_image3,)),) = cast(
+        dict, (await parse_image(png_path)).content
+    ).values()
+    parsed_image3.text = "Golden Gate"
+    parsed_image3.info["type"] = "table"
+    assert parsed_image != parsed_image3, "Expected tables to be differentiable"
+    assert (
+        parsed_image.to_id() != parsed_image3.to_id()
+    ), "Expected ID to mismatch between tables and images"
+    assert (
+        len({parsed_image, parsed_image3}) == 2
+    ), "Expected tables to be hashed differently"
+
+
+@pytest.mark.asyncio
+async def test_read_doc_images_metadata(stub_data_dir: Path) -> None:
+    png_path = stub_data_dir / "sf_districts.png"
+    doc = Doc(docname="stub", citation="stub", dockey="stub")
+
+    # Test parsing only
+    parsed_text = await read_doc(png_path, doc, parsed_text_only=True)
+    assert isinstance(parsed_text.content, dict)
+    assert "1" in parsed_text.content
+    page_content = parsed_text.content["1"]
+    assert isinstance(page_content, tuple)
+    text_content, (parsed_image,) = page_content
+    assert not text_content, "Expected no text content for an image"
+    assert isinstance(parsed_image, ParsedMedia)
+    assert parsed_image.index == 0
+    assert isinstance(parsed_image.data, bytes)
+    assert len(parsed_image.data) > 0
+    assert not parsed_image.text, "Expected no text content for a standalone image"
+    assert parsed_image.info["suffix"] == ".png"
+    image_id = parsed_image.to_id()
+    assert image_id.version == 4, "Expected a uuid4-compatible ID"
+    assert image_id == UUID("f6426bc3-382a-45a4-8677-08744044864f")
+    assert parsed_text.metadata.parse_type == "image"
+    assert parsed_text.metadata.count_parsed_media == 1
+    assert parsed_text.metadata.total_parsed_text_length == 0
+    assert parsed_text.metadata.chunk_metadata is None
+
+    # Test parsing + 'chunking'
+    (text,) = await read_doc(png_path, doc)
+    assert isinstance(text, Text)
+    assert text.doc == doc
+    (image,) = text.media
+    assert image == parsed_image
+
+    # Test including metadata
+    texts_with_metadata = await read_doc(png_path, doc, include_metadata=True)
+    assert isinstance(texts_with_metadata, tuple)
+    texts, metadata = texts_with_metadata
+    assert len(texts) == 1
+    assert texts[0] == text
+    assert metadata.parse_type == "image"
+    assert metadata.count_parsed_media == 1
+    assert metadata.total_parsed_text_length == 0
+    assert metadata.chunk_metadata is not None
+    assert not metadata.chunk_metadata.chunk_chars
+    assert not metadata.chunk_metadata.overlap
+    assert metadata.chunk_metadata.chunk_type == "no_chunk"
+
+
+@pytest.mark.asyncio
+async def test_read_doc_images_concurrency(stub_data_dir: Path) -> None:
+    png_path = stub_data_dir / "sf_districts.png"
+    doc = Doc(docname="stub", citation="stub", dockey="stub")
+    validation_mock = MagicMock()
+
+    async def validate(data: bytes) -> None:  # noqa: RUF029
+        validate_image(io.BytesIO(data))
+        validation_mock(data)
+
+    # Check we can concurrently read in the same image many times
+    concurrent_call_count = 10
+    seen_media = set()
+    bulk_texts = await asyncio.gather(
+        *(
+            read_doc(png_path, doc, validator=validate)
+            for _ in range(concurrent_call_count)
+        )
+    )
+    for (text,) in bulk_texts:
+        assert text.doc == doc
+        assert len(text.media) == 1
+        seen_media.add(text.media[0])
+    assert (
+        len(seen_media) == 1
+    ), "Expected the concurrent reads to all have the same parsed result"
+    validation_mock.assert_has_calls(
+        [call(next(iter(seen_media)).data)] * concurrent_call_count
+    )
 
 
 @pytest.mark.asyncio
@@ -1187,6 +1521,140 @@ async def test_code() -> None:
     assert len(docs.docs) == 1
     session = await docs.aquery("What file is read in by test_code?", settings=settings)
     assert "test_paperqa.py" in session.answer
+
+
+@pytest.mark.asyncio
+async def test_querying_tables(stub_data_dir: Path) -> None:
+    settings = Settings.from_name("fast")
+
+    docs = Docs()
+    assert await docs.aadd(stub_data_dir / "influence.pdf", settings=settings)
+    # Now, let's modify the system so any tables housed in the Text.text get removed,
+    # and the system can only rely on table images or markdown
+    texts_with_tables = {
+        t
+        for t in docs.texts
+        if t.media and any(m.info.get("type") == "table" for m in t.media)
+    }
+    assert texts_with_tables, "Expected some texts to have parsed tables"
+    for t in texts_with_tables:
+        # Wipe text but keep embedding (for retrieval), to confirm tables get used
+        t.text = "Placeholder"
+        # Wipe non-table media (e.g. images)
+        t.media = [m for m in t.media if m.info.get("type") == "table"]
+    docs.texts = list(texts_with_tables)
+    session = await docs.aquery(
+        "What osteotomy gap (mm) has the bone volume per slice?", settings=settings
+    )
+    assert session.used_contexts
+    used_texts = [c.text for c in session.contexts if c.id in session.used_contexts]
+    assert all(
+        [m.data for m in t.media] for t in used_texts
+    ), "Expected image data to be present in the used contexts"
+    assert any(x in session.answer for x in ("1.0 mm", "1.0-mm"))
+    assert session.cost > 0
+
+    # Filter contexts for HTTP requests, and ensure no images are present
+    session.filter_content_for_user()
+    assert session.used_contexts
+    used_texts_after_filter = [
+        c.text for c in session.contexts if c.id in session.used_contexts
+    ]
+    assert all(
+        not t.media for t in used_texts_after_filter
+    ), "Expected no media for lightweight HTTP requests"
+
+
+@pytest.mark.asyncio
+async def test_images(stub_data_dir: Path) -> None:
+    settings = Settings.from_name("fast")
+    # Let's use default prompting set up, so we can get JSON summary-support
+    settings.prompts = type(settings.prompts)()
+    # We don't support image embeddings yet, so disable embedding
+    settings.answer.evidence_retrieval = False
+    settings.parsing.defer_embedding = True
+
+    docs = Docs()
+    districts_docname = await docs.aadd(
+        stub_data_dir / "sf_districts.png",
+        citation=(
+            '"File:San francisco districts.png." Wikimedia Commons.'
+            " 7 Sep 2023, 07:38 UTC."
+            " <https://commons.wikimedia.org/w/index.php?title=File:San_francisco_districts.png&oldid=799209398>"
+            " July 2025."
+        ),
+        settings=settings,
+    )
+    assert districts_docname, "Expected successful image addition"
+    (districts_doc,) = (d for d in docs.docs.values() if d.docname == districts_docname)
+    session = await docs.aquery(
+        "What districts neighbor the Western Addition?", settings=settings
+    )
+    assert (
+        sum(
+            district in session.answer
+            for district in ("The Avenues", "Golden Gate", "Civic Center", "Haight")
+        )
+        >= 2
+    ), "Expected at least two neighbors to be matched"
+    assert session.cost > 0
+    contexts_used = [
+        c
+        for c in session.contexts
+        if c.id in session.used_contexts and c.text.doc == districts_doc
+    ]
+    assert contexts_used
+    assert all(c.used_images for c in contexts_used)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_images_corrupt(stub_data_dir: Path) -> None:
+    settings = Settings.from_name("fast")
+    # Let's use default prompting set up, so we can get JSON summary-support
+    settings.prompts = type(settings.prompts)()
+    # We don't support image embeddings yet, so disable embedding
+    settings.answer.evidence_retrieval = False
+    settings.parsing.defer_embedding = True
+
+    docs = Docs()
+    districts_docname = await docs.aadd(
+        stub_data_dir / "sf_districts.png",
+        citation=(
+            '"File:San francisco districts.png." Wikimedia Commons.'
+            " 7 Sep 2023, 07:38 UTC."
+            " <https://commons.wikimedia.org/w/index.php?title=File:San_francisco_districts.png&oldid=799209398>"
+            " July 2025."
+        ),
+        settings=settings,
+    )
+    assert districts_docname, "Expected successful image addition"
+    (districts_doc,) = (d for d in docs.docs.values() if d.docname == districts_docname)
+    for media in (t.media for t in docs.texts if t.doc == districts_doc and t.media):
+        for m in media:
+            # Validate the image, then chop the image in half (breaking it), and
+            # confirm it's no longer valid (and that we can detect it's no longer valid)
+            validate_image(io.BytesIO(m.data))
+            m.data = m.data[: len(m.data) // 2]
+            with pytest.raises(OSError, match="truncated"):
+                validate_image(io.BytesIO(m.data))
+    with pytest.raises(litellm.BadRequestError, match="unsupported image"):
+        await docs.aquery(
+            "What districts neighbor the Western Addition?", settings=settings
+        )
+    settings.answer.evidence_text_only_fallback = True
+    # The answer will be garbage, but let's make sure we didn't claim to use images
+    session = await docs.aquery(
+        "What districts neighbor the Western Addition?", settings=settings
+    )
+    assert session.used_contexts
+    assert session.cost > 0
+    contexts_used = [
+        c
+        for c in session.contexts
+        if c.id in session.used_contexts and c.text.doc == districts_doc
+    ]
+    assert contexts_used
+    assert all(not c.used_images for c in contexts_used)  # type: ignore[attr-defined]
 
 
 def test_zotero() -> None:
@@ -1232,10 +1700,10 @@ async def test_custom_prompts(stub_data_dir: Path) -> None:
     await docs.aadd(
         stub_data_dir / "bates.txt", "WikiMedia Foundation, 2023, Accessed now"
     )
-    answer = await docs.aquery(
+    session = await docs.aquery(
         "What country is Frederick Bates from?", settings=settings
     )
-    assert "United States" in answer.answer
+    assert "United States" in session.answer
 
 
 @pytest.mark.asyncio
@@ -1435,13 +1903,15 @@ def test_docdetails_merge_with_list_fields() -> None:
     assert isinstance(merged_doc, DocDetails), "Merged doc should also be DocDetails"
 
 
-def test_docdetails_deserialization() -> None:
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="Uses `csv.QUOTE_NOTNULL`.")
+def test_docdetails_deserialization(tmp_path) -> None:
     deserialize_to_doc = {
         "citation": "stub",
         "dockey": "stub",
         "docname": "Stub",
         "embedding": None,
         "formatted_citation": "stub",
+        "fields_to_overwrite_from_metadata": {"key", "doc_id", "docname", "citation"},
     }
     deepcopy_deserialize_to_doc = deepcopy(deserialize_to_doc)
     doc = Doc(**deserialize_to_doc)
@@ -1450,8 +1920,9 @@ def test_docdetails_deserialization() -> None:
         deserialize_to_doc == deepcopy_deserialize_to_doc
     ), "Deserialization should not mutate input"
 
-    doc_details = DocDetails(**deserialize_to_doc)
-    serialized_doc_details = doc_details.model_dump(exclude_none=True)
+    serialized_doc_details = DocDetails(**deserialize_to_doc).model_dump(
+        exclude_none=True
+    )
     for key, value in {
         "docname": "unknownauthorsUnknownyearunknowntitle",
         "citation": "Unknown authors. Unknown title. Unknown journal, Unknown year.",
@@ -1461,7 +1932,7 @@ def test_docdetails_deserialization() -> None:
             ' Unknown",\n    title = "Unknown title",\n    year = "Unknown year",\n   '
             ' journal = "Unknown journal"\n}\n'
         ),
-        "other": {},
+        "other": {"bibtex_source": ["self_generated"]},
         "formatted_citation": (
             "Unknown authors. Unknown title. Unknown journal, Unknown year."
         ),
@@ -1470,6 +1941,170 @@ def test_docdetails_deserialization() -> None:
     assert (
         deserialize_to_doc == deepcopy_deserialize_to_doc
     ), "Deserialization should not mutate input"
+
+    doc_details = DocDetails(
+        **deserialize_to_doc, other={"apple": "sauce"}, authors=["Thomas Anderson"]
+    )
+    DocDetails.to_csv([doc_details], target_csv_path=Path(tmp_path) / "manifest.csv")
+    with open(tmp_path / "manifest.csv", encoding="utf-8") as f:
+        csv_deserialized = DocDetails(
+            # type ignore comments are here since mypy can't recognize pytest skip
+            **next(csv.DictReader(f.readlines(), quoting=csv.QUOTE_NOTNULL))  # type: ignore[attr-defined,unused-ignore]
+        )
+    assert doc_details == csv_deserialized, "Round-trip CSV deserialization failed"
+
+
+def test_docdetails_doc_id_roundtrip() -> None:
+    """Test that DocDetails can be initialized with doc_id or doi inputs."""
+    test_doi = "10.1234/test.doi"
+    test_doi_doc_id = encode_id(test_doi.lower())
+    test_specified_doc_id = "abc123"
+    # first we test without a doc_id or doi, ensure it's still valid
+    doc_details_no_doi_no_doc_id = DocDetails(
+        docname="test_doc",
+        citation="Test Citation",
+        dockey="test_dockey",
+        embedding=None,
+        formatted_citation="Formatted Test Citation",
+    )
+
+    assert (
+        doc_details_no_doi_no_doc_id.doc_id != test_doi_doc_id
+    ), "DocDetails without doc_id should not match test_doi_doc_id"
+    assert (
+        doc_details_no_doi_no_doc_id.doi is None
+    ), "DocDetails without doi should have None doi"
+    assert doc_details_no_doi_no_doc_id.dockey == doc_details_no_doi_no_doc_id.doc_id
+
+    # now round-trip serializaiton should keep the same doc_id
+    new_no_doi_no_doc_id = DocDetails(
+        **doc_details_no_doi_no_doc_id.model_dump(exclude_none=True)
+    )
+    assert (
+        new_no_doi_no_doc_id.doc_id == doc_details_no_doi_no_doc_id.doc_id
+    ), "DocDetails without doc_id should keep the same doc_id after serialization"
+
+    # since validation runs on assignment, make sure we can assign correctly
+    doc_details_no_doi_no_doc_id.doc_id = test_specified_doc_id
+    assert (
+        doc_details_no_doi_no_doc_id.doc_id == test_specified_doc_id
+    ), "DocDetails with doc_id should match test_specified_doc_id"
+    assert doc_details_no_doi_no_doc_id.dockey == doc_details_no_doi_no_doc_id.doc_id
+
+    # now let's do this with a doi
+    doc_details_with_doi_no_doc_id = DocDetails(
+        doi=test_doi,
+        title=r"A Stub | \emph{Stub Title}",
+        docname="test_doc",
+        citation="Test Citation",
+        dockey="test_dockey",
+        embedding=None,
+        formatted_citation="Formatted Test Citation",
+    )
+    assert (
+        doc_details_with_doi_no_doc_id.doc_id == test_doi_doc_id
+    ), "DocDetails with doc_id should not match test_doi_doc_id"
+    assert (
+        doc_details_with_doi_no_doc_id.doi == test_doi
+    ), "DocDetails with doi should match test_doi"
+    assert (
+        doc_details_with_doi_no_doc_id.dockey == doc_details_with_doi_no_doc_id.doc_id
+    )
+    assert (
+        doc_details_with_doi_no_doc_id.make_filename()
+        == "A Stub - -emph{Stub Title}_7f8a71c920c202c5"
+    )
+
+    # round-trip serializaiton should keep the same doc_id
+    new_with_doi_no_doc_id = DocDetails(
+        **doc_details_with_doi_no_doc_id.model_dump(exclude_none=True)
+    )
+    assert (
+        new_with_doi_no_doc_id.doc_id == doc_details_with_doi_no_doc_id.doc_id
+    ), "DocDetails with doc_id should keep the same doc_id after serialization"
+    assert (
+        new_with_doi_no_doc_id.make_filename()
+        == "A Stub - -emph{Stub Title}_7f8a71c920c202c5"
+    )
+
+    # since validation runs on assignment, make sure we can assign correctly
+    doc_details_with_doi_no_doc_id.doc_id = test_specified_doc_id
+    assert (
+        doc_details_with_doi_no_doc_id.doc_id == test_specified_doc_id
+    ), "DocDetails with doc_id should match test_specified_doc_id"
+    assert (
+        doc_details_with_doi_no_doc_id.dockey == doc_details_with_doi_no_doc_id.doc_id
+    )
+
+    # let's specify the doc_id directly
+    doc_details_no_doi_with_doc_id = DocDetails(
+        doc_id=test_specified_doc_id,
+        docname="test_doc",
+        citation="Test Citation",
+        dockey="test_dockey",
+        embedding=None,
+        formatted_citation="Formatted Test Citation",
+    )
+    assert (
+        doc_details_no_doi_with_doc_id.doc_id == test_specified_doc_id
+    ), "DocDetails with doc_id should not match test_specified_doc_id"
+    assert (
+        doc_details_no_doi_with_doc_id.doi is None
+    ), "DocDetails without doi should be None"
+    assert (
+        doc_details_no_doi_with_doc_id.dockey == doc_details_no_doi_with_doc_id.doc_id
+    ), "DocDetails dockey should match doc_id for the same object"
+
+    # round-trip serializaiton should keep the same doc_id
+    new_no_doi_with_doc_id = DocDetails(
+        **doc_details_no_doi_with_doc_id.model_dump(exclude_none=True)
+    )
+    assert (
+        new_no_doi_with_doc_id.doc_id == doc_details_with_doi_no_doc_id.doc_id
+    ), "DocDetails with doc_id should keep the same doc_id after serialization"
+
+    # since validation runs on assignment, make sure we can assign correctly
+    new_no_doi_with_doc_id.doc_id = test_doi_doc_id
+    assert (
+        new_no_doi_with_doc_id.doc_id == test_doi_doc_id
+    ), "DocDetails with doc_id should match test_specified_doc_id"
+    assert new_no_doi_with_doc_id.dockey == new_no_doi_with_doc_id.doc_id
+
+    # now we specify both doi and doc_id, ensuring doc_id takes precedence
+    doc_details_with_doi_with_doc_id = DocDetails(
+        doc_id=test_specified_doc_id,
+        doi=test_doi,
+        docname="test_doc",
+        citation="Test Citation",
+        dockey="test_dockey",
+        embedding=None,
+        formatted_citation="Formatted Test Citation",
+    )
+    assert (
+        doc_details_with_doi_with_doc_id.doc_id == test_specified_doc_id
+    ), "DocDetails with doc_id should not match test_specified_doc_id"
+    assert (
+        doc_details_with_doi_with_doc_id.doi == test_doi
+    ), "DocDetails without doi should match test_doi"
+    assert (
+        doc_details_with_doi_with_doc_id.dockey
+        == doc_details_with_doi_with_doc_id.doc_id
+    )
+
+    # round-trip serializaiton should keep the same doc_id
+    new_with_doi_with_doc_id = DocDetails(
+        **doc_details_with_doi_with_doc_id.model_dump(exclude_none=True)
+    )
+    assert (
+        new_with_doi_with_doc_id.doc_id == doc_details_with_doi_with_doc_id.doc_id
+    ), "DocDetails with doc_id should keep the same doc_id after serialization"
+
+    # since validation runs on assignment, make sure we can assign correctly
+    new_with_doi_with_doc_id.doc_id = test_doi_doc_id
+    assert (
+        new_with_doi_with_doc_id.doc_id == test_doi_doc_id
+    ), "DocDetails with doc_id should match test_specified_doc_id"
+    assert new_with_doi_with_doc_id.dockey == new_with_doi_with_doc_id.doc_id
 
 
 @pytest.mark.vcr
@@ -1755,6 +2390,10 @@ class TestLLMParseJson:
                 "Hope this helps!",
                 id="fixing-broken-json-formatting-in-string-comma-3",
             ),
+            pytest.param(
+                '{   "summary": "Lorem Ipsum"   "relevance_score": 8 }',
+                id="missing-comma-between-fields",
+            ),
         ],
     )
     def test_json_broken_formatting(self, input_text: str) -> None:
@@ -1814,3 +2453,49 @@ def test_maybe_get_date():
     assert maybe_get_date(datetime(2023, 1, 1)) == datetime(2023, 1, 1)
     assert maybe_get_date("foo") is None
     assert maybe_get_date("") is None
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "cleaned_text"),
+    [
+        ("name", "name"),
+        (" name", " name"),
+        ("name ", "name "),
+        (" ", " "),
+        ("Bates name", "Bates name"),
+        ("Bate's name", "Bates name"),
+        ("Bate's name Bate's name", "Bates name Bates name"),
+        ("Bates' name", "Bates name"),
+        ("X's Y", "Xs Y"),
+        ("' name", "name"),
+        (" ' name", " name"),
+        ("name ' name", "name name"),
+        ("'s name", "name"),
+        (" 's name", " name"),
+        ("s' name", "s name"),
+        ("S' name", "S name"),
+        ("Bates 's name", "Bates name"),
+    ],
+)
+def test_clean_possessives(raw_text: str, cleaned_text: str) -> None:
+    assert clean_possessives(raw_text) == cleaned_text
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(b"Hello, World!", id="simple-text"),
+        pytest.param(b"", id="empty-bytes"),
+        pytest.param(bytes([0, 1, 2, 255, 128, 64]), id="binary-data"),
+        pytest.param(b"Test data for base64 encoding", id="base64-validation"),
+        pytest.param("Hello 世界 🌍".encode(), id="utf8-text"),
+    ],
+)
+def test_str_bytes_conversions(value: bytes) -> None:
+    # Test round-trip conversion
+    encoded_string = bytes_to_string(value)
+    decoded_bytes = string_to_bytes(encoded_string)
+    assert decoded_bytes == value
+
+    # Validate that encoded string is valid base64
+    assert base64.b64decode(encoded_string) == value
