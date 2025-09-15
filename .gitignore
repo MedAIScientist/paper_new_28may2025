@@ -311,4 +311,14 @@ tests/example2.*
 !tests/stub_data/.DS_Store
 
 # Client data
-src/paperqa/clients/client_data/retractions.csv
+paperqa/clients/client_data/retractions.csv
+
+
+/log/*
+/doctor_advice/*
+/my_papers_bak/*
+/my_papers/*
+/.pqa/*
+/physionet.org/*
+
+
